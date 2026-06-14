@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TL494 Push-Pull Oscilloscope</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body, html { 
+            margin: 0; padding: 0; width: 100%; height: 100%; 
+            background-color: #020a05; overflow: hidden; 
+            font-family: 'Courier New', Courier, monospace; 
+            user-select: none;
+        }
+        
+        #scopeCanvas { 
+            display: block; width: 100%; height: 100%; 
+        }
+
+        .crt-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; z-index: 10;
+            background: 
+                linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), 
+                linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+            background-size: 100% 4px, 3px 100%;
+            box-shadow: inset 0 0 100px rgba(0,0,0,0.9);
+        }
+
+        .floating-panel {
+            position: absolute; top: 20px; right: 20px; z-index: 20;
+            background: rgba(0, 20, 10, 0.85);
+            border: 1px solid #166534;
+            border-radius: 8px; padding: 15px;
+            backdrop-filter: blur(4px);
+            color: #4ade80;
+            width: 320px;
+            box-shadow: 0 4px 30px rgba(0,0,0,0.5);
+            transition: opacity 0.3s;
+        }
+
+        .floating-panel:hover { opacity: 1; }
+
+        input[type=range] { accent-color: #4ade80; width: 100%; margin-top: 5px; }
+        
+        .glow { text-shadow: 0 0 5px currentColor; }
+        
+        .channel-label {
+            position: absolute; left: 20px; z-index: 20; font-size: 14px; font-weight: bold;
+            background: rgba(0,0,0,0.7); padding: 4px 8px; border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="scopeCanvas"></canvas>
+    <div class="crt-overlay"></div>
+
+    <!-- On-Screen Display (OSD) Labels -->
+    <div id="osd-ch1" class="channel-label text-green-400 glow" style="top: 10%;">CH1: V_GATE 1 (10V/div)</div>
+    <div id="osd-ch2" class="channel-label text-blue-400 glow" style="top: 35%;">CH2: V_GATE 2 (10V/div)</div>
+    <div id="osd-ch3" class="channel-label text-red-400 glow" style="top: 60%;">CH3: V_DS1 DRAIN (20V/div)</div>
+    <div id="osd-ch4" class="channel-label text-yellow-400 glow" style="top: 85%;">CH4: V_SEC OUT (200V/div)</div>
+
+    <div class="absolute bottom-5 left-5 z-20 text-green-500 font-bold glow text-lg">
+        TIMEBASE: 10µs / DIV | TRIGGER: CH1 RISING
+    </div>
+
+    <!-- Minimal Overlay Controls -->
+    <div class="floating-panel">
+        <div class="flex justify-between border-b border-green-800 pb-2 mb-4">
+            <span class="font-bold tracking-widest glow">PARAMETER SWEEP</span>
+            <span id="fpsCounter" class="text-xs text-green-700">60 FPS</span>
+        </div>
+
+        <div class="mb-4">
+            <div class="flex justify-between text-xs mb-1">
+                <span>PWM Duty Cycle (EA1)</span>
+                <span id="lblDuty">45.0 %</span>
+            </div>
+            <input type="range" id="sliderDuty" min="10" max="48" step="0.5" value="45">
+        </div>
+
+        <div class="mb-4">
+            <div class="flex justify-between text-xs mb-1 text-red-400 glow">
+                <span>L·di/dt Inductive Load</span>
+                <span id="lblLoad">High</span>
+            </div>
+            <input type="range" id="sliderLoad" min="0" max="100" step="1" value="80">
+        </div>
+
+        <div class="mb-2">
+            <div class="flex justify-between text-xs mb-1 text-yellow-400 glow">
+                <span>RC Snubber Damping (ζ)</span>
+                <span id="lblSnub">0.15 (Under)</span>
+            </div>
+            <input type="range" id="sliderSnub" min="0.05" max="1.0" step="0.01" value="0.15">
+        </div>
+        
+        <div class="text-[10px] text-green-600 mt-4 leading-tight">
+            Analyze CH3 (Red). Lowering damping causes parasitic LC ringing exceeding MOSFET V_DSS ratings.
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('scopeCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Physics State
+        const period = 1000; 
+        let time = 0;
+        let traceData = []; 
+        const SCOPE_TIME_WINDOW = period * 2.5; 
+
+        // UI
+        const ui = {
+            duty: document.getElementById('sliderDuty'),
+            load: document.getElementById('sliderLoad'),
+            snub: document.getElementById('sliderSnub'),
+            lblDuty: document.getElementById('lblDuty'),
+            lblLoad: document.getElementById('lblLoad'),
+            lblSnub: document.getElementById('lblSnub'),
+            fps: document.getElementById('fpsCounter')
+        };
+
+        let lastTime = performance.now();
+        let frames = 0;
+
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            
+            // Adjust OSD positions dynamically based on vertical divisions
+            const h = canvas.height;
+            document.getElementById('osd-ch1').style.top = `${(1.5/8) * 100 - 3}%`;
+            document.getElementById('osd-ch2').style.top = `${(3.5/8) * 100 - 3}%`;
+            document.getElementById('osd-ch3').style.top = `${(5.5/8) * 100 - 3}%`;
+            document.getElementById('osd-ch4').style.top = `${(7.5/8) * 100 - 3}%`;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        function drawGrid(w, h) {
+            ctx.strokeStyle = 'rgba(74, 222, 128, 0.15)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            
+            // 10 Horizontal Divisions
+            for(let i=1; i<10; i++) {
+                let x = i * (w/10);
+                ctx.moveTo(x, 0); ctx.lineTo(x, h);
+            }
+            
+            // 8 Vertical Divisions
+            for(let i=1; i<8; i++) {
+                let y = i * (h/8);
+                ctx.moveTo(0, y); ctx.lineTo(w, y);
+            }
+            ctx.stroke();
+
+            // Center Crosshairs
+            ctx.strokeStyle = 'rgba(74, 222, 128, 0.3)';
+            ctx.beginPath();
+            for(let i=0; i<50; i++) {
+                ctx.moveTo(i*(w/50), h/2 - 3); ctx.lineTo(i*(w/50), h/2 + 3);
+                ctx.moveTo(w/2 - 3, i*(h/40)); ctx.lineTo(w/2 + 3, i*(h/40));
+            }
+            ctx.stroke();
+        }
+
+        function updatePhysics(dt) {
+            time += dt * 1.5; // Speed multiplier
+
+            const t_cycle = time % period;
+            const phase = t_cycle / period; 
+
+            const dutyLimit = parseFloat(ui.duty.value) / 100;
+            const damping = parseFloat(ui.snub.value);
+            const loadMag = parseFloat(ui.load.value) / 100;
+
+            let vg1 = 0, vg2 = 0, vds1 = 12, vsec = 0;
+            const V_BUS = 12;
+
+            // Synthesis
+            if (phase < dutyLimit) {
+                vg1 = 12;
+                vds1 = 0.5; 
+                vsec = 340;
+            } else if (phase >= 0.5 && phase < 0.5 + dutyLimit) {
+                vg2 = 12;
+                vds1 = 24; 
+                vsec = -340;
+            } else {
+                // Deadtime & Flyback Ringing
+                vds1 = V_BUS; 
+                vsec = 0;
+
+                let tOff = 0;
+                let polarity = 1;
+
+                if (phase >= dutyLimit && phase < 0.5) {
+                    tOff = (phase - dutyLimit) * period;
+                    polarity = 1; 
+                } else if (phase >= 0.5 + dutyLimit) {
+                    tOff = (phase - (0.5 + dutyLimit)) * period;
+                    polarity = -1; 
+                }
+
+                if (tOff < 150) {
+                    const dampFactor = Math.exp(-tOff * (0.01 + damping * 0.15));
+                    const osc = Math.cos(tOff * 0.4); 
+                    
+                    const spikeAmp = 40 * loadMag * (1.1 - damping);
+
+                    if (polarity === 1) {
+                        vds1 = V_BUS + spikeAmp * dampFactor * osc;
+                        vsec = (spikeAmp * 10) * dampFactor * Math.sin(tOff * 0.4);
+                    } else {
+                        vds1 = V_BUS - (spikeAmp*0.6) * dampFactor * osc;
+                        vsec = -(spikeAmp * 10) * dampFactor * Math.sin(tOff * 0.4);
+                    }
+                }
+            }
+
+            traceData.push({ t: time, vg1, vg2, vds1, vsec });
+            
+            // Clean up old data
+            if (time - traceData[0].t > SCOPE_TIME_WINDOW) {
+                traceData.shift();
+            }
+        }
+
+        function renderTrace() {
+            const w = canvas.width;
+            const h = canvas.height;
+
+            ctx.clearRect(0, 0, w, h);
+            drawGrid(w, h);
+
+            if (traceData.length < 2) return;
+
+            const latestT = traceData[traceData.length - 1].t;
+            
+            const drawChannel = (key, color, scale, yOffset) => {
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2.5;
+                ctx.shadowBlur = 8;
+                ctx.shadowColor = color;
+                ctx.lineJoin = 'round';
+                ctx.beginPath();
+
+                for (let i = 0; i < traceData.length; i++) {
+                    const pt = traceData[i];
+                    const x = w - ((latestT - pt.t) / SCOPE_TIME_WINDOW) * w;
+                    const y = yOffset - (pt[key] * scale);
+                    
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+            };
+
+            // Mapping to the 8 vertical divisions
+            drawChannel('vg1', '#4ade80', (h/8)*0.06, h * (1.8/8)); 
+            drawChannel('vg2', '#60a5fa', (h/8)*0.06, h * (3.8/8)); 
+            drawChannel('vds1', '#f87171', (h/8)*0.03, h * (6.2/8)); 
+            drawChannel('vsec', '#facc15', (h/8)*0.002, h * (7.5/8)); 
+
+            ctx.shadowBlur = 0;
+        }
+
+        function updateUI() {
+            ui.lblDuty.textContent = parseFloat(ui.duty.value).toFixed(1) + ' %';
+            
+            const l = parseInt(ui.load.value);
+            ui.lblLoad.textContent = l > 75 ? 'High' : l > 30 ? 'Med' : 'Low';
+            
+            const z = parseFloat(ui.snub.value);
+            let zText = z.toFixed(2);
+            if(z < 0.3) zText += ' (Under)';
+            else if(z > 0.7) zText += ' (Crit)';
+            ui.lblSnub.textContent = zText;
+        }
+
+        function frame(timestamp) {
+            let dt = timestamp - lastTime;
+            
+            // FPS Counter
+            frames++;
+            if (timestamp - lastTime >= 1000) {
+                ui.fps.textContent = frames + ' FPS';
+                frames = 0;
+                lastTime = timestamp;
+            }
+
+            // Cap extremely large deltas (e.g., tab backgrounded)
+            if (dt > 50) dt = 16;
+
+            updatePhysics(16); // Fixed physics step for smooth continuous drawing
+            renderTrace();
+            
+            requestAnimationFrame(frame);
+        }
+
+        // Bindings
+        [ui.duty, ui.load, ui.snub].forEach(el => el.addEventListener('input', updateUI));
+        
+        // Start
+        updateUI();
+        requestAnimationFrame(frame);
+
+    </script>
+</body>
+</html>
